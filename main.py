@@ -4,30 +4,37 @@ import pickle
 import streamlit as st
 import pandas as pd
 import numpy as np
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
 
 # ---------------- Page config ----------------
 st.set_page_config(page_title="Customer Churn Prediction", layout="wide")
 st.title("Telecom Customer Churn Predictor 🔮")
-st.write("Quick, real-world demo: same preprocessing as training → consistent predictions.")
+st.write(
+    "This interactive web app predicts customer churn based on their information. Please input the customer's details on the left sidebar to get a prediction.")
 
 # ---------------- Paths (adjust if needed) ----------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PREPROCESSOR_PKL = os.path.join(BASE_DIR, "Model", "preprocessor.pkl")
 MODEL_PKL = os.path.join(BASE_DIR, "Model", "model.pkl")
-FEATURE_COLS_PKL = os.path.join(BASE_DIR, "Model", "feature_columns.pkl")  # optional
 
 # ---------------- Load artifacts ----------------
-if not os.path.exists(PREPROCESSOR_PKL) or not os.path.exists(MODEL_PKL):
-    st.error("Missing model artifacts. Put preprocessor.pkl and model.pkl inside the Model/ folder.")
+try:
+    with open(PREPROCESSOR_PKL, "rb") as f:
+        preprocessor = pickle.load(f)
+    with open(MODEL_PKL, "rb") as f:
+        model = pickle.load(f)
+except FileNotFoundError:
+    st.error("Missing model artifacts. Please ensure 'preprocessor.pkl' and 'model.pkl' are in the 'Model/' folder.")
     st.stop()
-
-with open(PREPROCESSOR_PKL, "rb") as f:
-    preprocessor = pickle.load(f)
-with open(MODEL_PKL, "rb") as f:
-    model = pickle.load(f)
+except Exception as e:
+    st.error(f"Error loading model artifacts: {e}")
+    st.stop()
 
 # ---------------- Sidebar inputs ----------------
 st.sidebar.header("Customer Input")
+
+
 def user_input_features():
     gender = st.sidebar.selectbox("Gender", ("Male", "Female"))
     partner = st.sidebar.selectbox("Partner", ("Yes", "No"))
@@ -50,11 +57,11 @@ def user_input_features():
     monthly_charges = st.sidebar.slider("Monthly Charges ($)", 0.0, 150.0, 70.0)
     total_charges_default = float(monthly_charges * tenure)
     total_charges = st.sidebar.slider("Total Charges ($)", 0.0, 10000.0, total_charges_default)
-    senior = st.sidebar.selectbox("Senior Citizen", ("No", "Yes"))
+    senior_citizen = st.sidebar.selectbox("Senior Citizen", ("No", "Yes"))
 
     data = {
         "gender": gender,
-        "SeniorCitizen": 1 if senior == "Yes" else 0,
+        "SeniorCitizen": 1 if senior_citizen == "Yes" else 0,
         "Partner": partner,
         "Dependents": dependents,
         "tenure": tenure,
@@ -75,126 +82,112 @@ def user_input_features():
     }
     return pd.DataFrame(data, index=[0])
 
+
 input_df = user_input_features()
 
-# ---------------- Preprocess (match training) ----------------
-def apply_training_style_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    # Contract -> numeric months (match notebook)
-    contract_map = {"Month-to-month": 1, "One year": 12, "Two year": 24}
-    if "Contract" in df.columns:
-        df["Contract"] = df["Contract"].map(contract_map).astype(float)
-    # gender label-encode used in training: Female=0, Male=1
-    if "gender" in df.columns:
-        df["gender"] = df["gender"].map({"Female": 0, "Male": 1}).astype(float)
-    # ensure numeric
-    for col in ["MonthlyCharges", "TotalCharges", "tenure", "SeniorCitizen", "Contract"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    # engineered features (must match training)
-    if "CLV" not in df.columns:
-        df["CLV"] = df["tenure"] * df["MonthlyCharges"]
-    if "Tenure_Contract" not in df.columns:
-        df["Tenure_Contract"] = df["tenure"] * df["Contract"]
-    return df
 
 # ---------------- Small helper to render big colored banner --------------
-def show_result_banner(is_churn: bool, prob: float | None, threshold: float):
+def show_result_banner(is_churn: bool, prob: float, threshold: float):
     if is_churn:
-        st.markdown(f"<h2 style='color:#b00020;'>❌ Customer likely to CHURN — risk ≥ {threshold:.2f}</h2>", unsafe_allow_html=True)
+        st.markdown(f"""
+            <div style='background-color: #ffcccc; padding: 10px; border-radius: 5px;'>
+                <h2 style='color:#b00020;'>❌ Customer is likely to CHURN (Risk ≥ {threshold:.0%})</h2>
+            </div>
+            """, unsafe_allow_html=True)
     else:
-        st.markdown(f"<h2 style='color:#0b6623;'>✅ Customer likely to STAY — risk < {threshold:.2f}</h2>", unsafe_allow_html=True)
-    if prob is not None:
-        # big numeric metric
-        st.metric(label="Churn probability", value=f"{prob:.2%}")
-        # probability bar (visual)
-        bar_df = pd.DataFrame({"probability":[prob]})
-        st.bar_chart(bar_df.T)  # single-column bar chart (simple visual)
-    else:
-        st.info("Model does not provide probability (predict_proba unavailable).")
+        st.markdown(f"""
+            <div style='background-color: #ccffcc; padding: 10px; border-radius: 5px;'>
+                <h2 style='color:#0b6623;'>✅ Customer is likely to STAY (Risk < {threshold:.0%})</h2>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # Big numeric metric for churn probability
+    st.metric(label="Churn Probability", value=f"{prob:.2%}")
+
+    # Probability bar (visual) using st.progress
+    st.progress(prob)
+
 
 # ---------------- Main prediction flow ----------------
 st.subheader("Customer Input Summary")
-st.write(input_df)  # user sees the raw inputs first
+st.write(input_df)
 
 threshold = st.slider("Decision threshold for classifying 'Churn'", 0.0, 1.0, 0.5, 0.01)
 
 if st.button("Predict Churn"):
-    # 1) Apply notebook-style preprocessing
-    model_inputs = apply_training_style_preprocessing(input_df)
-    st.write("After training-style preprocessing:")
-    st.write(model_inputs)
+    # Create a copy to avoid modifying the displayed summary dataframe
+    df_to_process = input_df.copy()
 
-    # 2) Transform via preprocessor
+    # --- Replicate Feature Engineering from the Notebook ---
+    # The preprocessor expects these columns to exist before it runs.
+
+    # 1. Map 'Contract' to numeric values. This REPLACES the text column.
+    contract_map = {"Month-to-month": 1, "One year": 12, "Two year": 24}
+    df_to_process['Contract'] = df_to_process['Contract'].map(contract_map)
+
+    # 2. Map 'gender' to numeric.
+    gender_map = {"Male": 1, "Female": 0}
+    df_to_process['gender'] = df_to_process['gender'].map(gender_map)
+
+    # 3. Create the engineered features using the now-numeric columns.
+    df_to_process['Tenure_Contract'] = df_to_process['tenure'] * df_to_process['Contract']
+    df_to_process['CLV'] = df_to_process['tenure'] * df_to_process['MonthlyCharges']
+
+    # 4) Transform via preprocessor
     try:
-        X_trans = preprocessor.transform(model_inputs)
-        X_arr = np.asarray(X_trans)
-        st.write("preprocessor.transform output shape:", X_arr.shape, "dtype:", X_arr.dtype)
+        X_trans = preprocessor.transform(df_to_process)
     except Exception as e:
-        st.error("preprocessor.transform() failed. Check preprocessor/model alignment.")
+        st.error(
+            "There was an error during the data preprocessing step. Please check the input values and ensure they are consistent with the model's training data.")
         st.exception(e)
         st.stop()
 
-    # 3) Ensure numeric array
+    # 5) Predict
     try:
-        if not np.issubdtype(X_arr.dtype, np.number):
-            X_arr = X_arr.astype(float)
+        proba = model.predict_proba(X_trans)[:, 1]
     except Exception as e:
-        st.error("Transformed output cannot be converted to numeric array.")
+        st.error("The model failed to make a prediction. Please check the model file and input data.")
         st.exception(e)
         st.stop()
 
-    # 4) Predict
-    try:
-        pred = model.predict(X_arr)
-        proba = model.predict_proba(X_arr)[:, 1] if hasattr(model, "predict_proba") else None
-    except Exception as e:
-        st.error("Model prediction failed.")
-        st.exception(e)
-        st.stop()
+    # 6) Determine churn flag using threshold
+    churn_prob = float(proba[0])
+    is_churn = churn_prob >= threshold
 
-    # 5) Determine churn flag using threshold
-    if proba is not None:
-        churn_prob = float(proba[0])
-        is_churn = 1 if churn_prob >= threshold else 0
-    else:
-        churn_prob = None
-        try:
-            is_churn = int(pred[0])
-        except Exception:
-            is_churn = 1 if str(pred[0]).lower().startswith("y") else 0
-
-    # 6) Append result into same table and show
+    # 7) Append result into same table and show
     display_df = input_df.copy()
-    display_df["Predicted_Churn"] = ["Yes" if is_churn == 1 else "No"]
-    if churn_prob is not None:
-        display_df["Churn_Prob"] = [f"{churn_prob:.2%}"]
+    display_df["Predicted_Churn"] = "Yes" if is_churn else "No"
+    display_df["Churn_Prob"] = f"{churn_prob:.2%}"
     st.subheader("Input + Prediction")
     st.write(display_df)
 
-    # 7) Friendly banner + probability visual
-    show_result_banner(is_churn == 1, churn_prob, threshold)
+    # 8) Friendly banner + probability visual
+    show_result_banner(is_churn, churn_prob, threshold)
 
-    # 8) Optional debug block (collapsed)
-    with st.expander("Debug: model internals (show/hide)"):
-        st.write("Transformed numeric vector (first row):")
-        st.write(X_arr[0][:100])  # show first 100 values
-        if hasattr(preprocessor, "get_feature_names_out"):
-            try:
-                fn = preprocessor.get_feature_names_out()
-                feat_df = pd.DataFrame([X_arr[0]], columns=fn)
-                st.write("Top features (after transform) — first 60:")
-                st.write(feat_df.T.head(60))
-            except Exception as e:
-                st.write("Can't get feature names:", e)
-        # show model coefficients / importances if available
+    # 9) Optional debug block (collapsed)
+    with st.expander("Debug: Model Internals (Show/Hide)"):
+        st.write("Data after feature engineering (before scaling/encoding):")
+        st.write(df_to_process)
+        st.write("Transformed data (first 20 features):")
+
+        # --- CORRECTED DEBUG CODE ---
+        # Check if the transformed data is a sparse matrix or a dense numpy array
+        if hasattr(X_trans, "toarray"):
+            # If it's sparse, convert it to a dense array to display
+            st.write(X_trans.toarray()[0, :20])
+        else:
+            # If it's already a dense array, display it directly
+            st.write(X_trans[0, :20])
+
+        st.write("Model Coefficients (first 20):")
         if hasattr(model, "coef_"):
-            st.write("Model coef_ (first 60):")
-            st.write(model.coef_.ravel()[:60])
+            st.write(model.coef_[0, :20])
         elif hasattr(model, "feature_importances_"):
-            st.write("Model feature_importances_ (first 60):")
-            st.write(model.feature_importances_[:60])
+            st.write("Model Feature Importances (first 20):")
+            st.write(model.feature_importances_[:20])
 
 # Footer
 st.markdown("---")
-st.caption("UX: single-row input -> predict -> appended results, with a probability bar and threshold control. Model behavior depends on training quality; if prob looks extreme, retrain/calibrate the model.")
+st.caption(
+    "This app uses a machine learning model to predict customer churn. The model's behavior depends on the quality of the training data; if the probability seems extreme, the model may need to be retrained or calibrated.")
+
